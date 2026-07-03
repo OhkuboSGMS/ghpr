@@ -1,0 +1,392 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+base_dir="${HOME}/work/prs"
+
+# Source repo for self-update. Override with env vars if you fork/rename.
+GHPR_REPO="${GHPR_REPO:-OhkuboSGMS/ghpr}"
+GHPR_BRANCH="${GHPR_BRANCH:-master}"
+
+print_usage() {
+  echo "Usage:" >&2
+  echo "  ghpr <pr-number> <owner/repo>" >&2
+  echo "  ghpr <github-pr-url>" >&2
+  echo "  ghpr create <owner/repo|repo-url> <branch>" >&2
+  echo "  ghpr clean [-n|--dry-run] [-y|--yes] [--days <N>]" >&2
+  echo "  ghpr update" >&2
+  echo "" >&2
+  echo "Examples:" >&2
+  echo "  ghpr 125 octocat/Hello-World" >&2
+  echo "  ghpr https://github.com/octocat/Hello-World/pull/125" >&2
+  echo "  ghpr create octocat/Hello-World feature/login" >&2
+  echo "  ghpr clean            # remove work dirs whose PR is merged/closed" >&2
+  echo "  ghpr clean --dry-run  # list candidates without deleting" >&2
+  echo "  ghpr update           # update ghpr itself to the latest version" >&2
+}
+
+# Download the latest ghpr + ghpr.sh from GHPR_REPO and replace the installed
+# copies in ~/.local/bin. Uses gh for auth, so it works with private repos too.
+update_self() {
+  if ! command -v gh &>/dev/null; then
+    echo "Error: GitHub CLI (gh) is required for 'ghpr update'" >&2
+    echo "Install it from: https://cli.github.com/" >&2
+    return 1
+  fi
+
+  local bindir="${HOME}/.local/bin"
+  mkdir -p "$bindir"
+
+  # Stage downloads in a temp dir on the SAME filesystem as bindir so the final
+  # swap is an atomic rename (and never corrupts the script that's running now).
+  local tmp
+  tmp="$(mktemp -d "${bindir}/.ghpr-update.XXXXXX")" || {
+    echo "Error: could not create temp dir under ${bindir}" >&2
+    return 1
+  }
+  trap 'rm -rf "$tmp"' RETURN
+
+  echo "==> Updating ghpr from ${GHPR_REPO}@${GHPR_BRANCH}..."
+
+  local f
+  for f in ghpr ghpr.sh; do
+    if ! gh api "repos/${GHPR_REPO}/contents/${f}?ref=${GHPR_BRANCH}" \
+           --jq '.content' 2>/dev/null | base64 -d > "${tmp}/${f}"; then
+      echo "Error: failed to download ${f} from ${GHPR_REPO}@${GHPR_BRANCH}" >&2
+      return 1
+    fi
+    if [ ! -s "${tmp}/${f}" ]; then
+      echo "Error: downloaded ${f} is empty; aborting (nothing was changed)" >&2
+      return 1
+    fi
+  done
+
+  chmod 0755 "${tmp}/ghpr"
+  chmod 0644 "${tmp}/ghpr.sh"
+  mv -f "${tmp}/ghpr"    "${bindir}/ghpr"
+  mv -f "${tmp}/ghpr.sh" "${bindir}/ghpr.sh"
+
+  echo "==> Updated ${bindir}/ghpr and ${bindir}/ghpr.sh"
+  echo "    Reload the wrapper to pick up changes: source ~/.zshrc  (or open a new shell)"
+}
+
+# Clone <repo> into the standard work dir and create <branch> off the latest
+# default branch (main/master). Mirrors the PR-checkout layout under work/prs.
+create_branch() {
+  local repo="${1:-}" branch="${2:-}"
+  if [ -z "$repo" ] || [ -z "$branch" ]; then
+    echo "Usage: ghpr create <owner/repo|repo-url> <branch>" >&2
+    return 1
+  fi
+
+  if ! command -v gh &>/dev/null; then
+    echo "Error: GitHub CLI (gh) is required for 'ghpr create'" >&2
+    echo "Install it from: https://cli.github.com/" >&2
+    return 1
+  fi
+
+  # Normalize the repo argument to an "owner/repo" slug. parse_repo_slug handles
+  # https/ssh URLs; a bare "owner/repo" is already in the right form.
+  local repo_slug
+  repo_slug="$(parse_repo_slug "$repo")"
+  [ -z "$repo_slug" ] && repo_slug="${repo%.git}"
+
+  local repo_name="${repo_slug##*/}"
+  local branch_dir="${branch//\//-}"          # flatten slashes for the dir name
+  local work_dir="${base_dir}/${repo_name}-${branch_dir}"
+
+  mkdir -p "${base_dir}"
+
+  echo "==> Use workdir: ${work_dir}"
+
+  if [ ! -d "${work_dir}/.git" ]; then
+    echo "==> No git repo found in ${work_dir}. Cloning via gh repo clone..."
+    rm -rf "${work_dir}"
+    gh repo clone "${repo_slug}" "${work_dir}"
+  else
+    echo "==> Existing git repo found in ${work_dir}"
+  fi
+
+  cd "${work_dir}"
+
+  # Resolve the default branch (main/master) from the remote, with fallbacks.
+  local default_branch
+  default_branch="$(gh repo view "${repo_slug}" --json defaultBranchRef --jq '.defaultBranchRef.name' 2>/dev/null || true)"
+  if [ -z "$default_branch" ]; then
+    default_branch="$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@' || true)"
+  fi
+  [ -z "$default_branch" ] && default_branch="main"
+
+  echo "==> Fetching latest origin/${default_branch}..."
+  git fetch origin "${default_branch}"
+
+  if git show-ref --verify --quiet "refs/heads/${branch}"; then
+    echo "==> Branch '${branch}' already exists locally; checking it out"
+    git checkout "${branch}"
+  else
+    if git show-ref --verify --quiet "refs/remotes/origin/${branch}"; then
+      echo "Note: a remote branch 'origin/${branch}' already exists." >&2
+      echo "      Creating a fresh local branch from origin/${default_branch} as requested." >&2
+    fi
+    echo "==> Creating branch '${branch}' from origin/${default_branch}"
+    # --no-track: this is a fresh branch, not a copy that should push to the
+    # default branch. Leave upstream unset until the user pushes it.
+    git checkout -b "${branch}" --no-track "origin/${default_branch}"
+  fi
+}
+
+print_clean_usage() {
+  echo "Usage: ghpr clean [options]" >&2
+  echo "" >&2
+  echo "Remove work directories under ${base_dir} whose PR is merged or closed." >&2
+  echo "Directories with uncommitted changes or stashes are always kept." >&2
+  echo "" >&2
+  echo "Options:" >&2
+  echo "  -n, --dry-run   List deletion candidates without removing anything" >&2
+  echo "  -y, --yes       Delete without the interactive confirmation prompt" >&2
+  echo "      --days <N>  Also flag dirs not modified for N+ days (default: off)" >&2
+  echo "  -h, --help      Show this help" >&2
+}
+
+# Parse "owner/repo" out of a git remote URL (https or ssh form).
+parse_repo_slug() {
+  local url="$1"
+  if [[ "$url" =~ github\.com[:/]+([^/]+)/([^/]+) ]]; then
+    local owner="${BASH_REMATCH[1]}"
+    local name="${BASH_REMATCH[2]}"
+    name="${name%.git}"
+    printf '%s/%s\n' "$owner" "$name"
+  fi
+}
+
+# Return 0 (true) if the repo has work that could be lost on deletion.
+workdir_is_dirty() {
+  local dir="$1"
+  # Uncommitted changes (staged, unstaged, or untracked).
+  if [ -n "$(git -C "$dir" status --porcelain 2>/dev/null)" ]; then
+    return 0
+  fi
+  # Stashed work.
+  if [ -n "$(git -C "$dir" stash list 2>/dev/null)" ]; then
+    return 0
+  fi
+  return 1
+}
+
+clean_workdirs() {
+  local dry_run=0 assume_yes=0 days=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -n|--dry-run) dry_run=1 ;;
+      -y|--yes) assume_yes=1 ;;
+      --days)
+        shift
+        if [ $# -eq 0 ] || ! [[ "${1:-}" =~ ^[0-9]+$ ]]; then
+          echo "Error: --days requires a number" >&2
+          return 1
+        fi
+        days="$1"
+        ;;
+      -h|--help) print_clean_usage; return 0 ;;
+      *) echo "Error: unknown option for clean: $1" >&2; print_clean_usage; return 1 ;;
+    esac
+    shift
+  done
+
+  if [ ! -d "$base_dir" ]; then
+    echo "No work directory found: ${base_dir} (nothing to clean)"
+    return 0
+  fi
+
+  if ! command -v gh &>/dev/null; then
+    echo "Error: GitHub CLI (gh) is required for 'ghpr clean'" >&2
+    echo "Install it from: https://cli.github.com/" >&2
+    return 1
+  fi
+
+  echo "==> Scanning ${base_dir} for cleanup candidates..."
+
+  local to_delete=()    # "dir|repo #pr|state|title"
+  local skipped=()      # "dir|reason"
+  local kept=()         # "dir|state"
+  local unknown=()      # "dir|reason"
+
+  local dir name pr_number remote_url repo_slug info state title reason
+  shopt -s nullglob
+  for dir in "$base_dir"/*-pr*; do
+    [ -d "$dir" ] || continue
+    name="$(basename "$dir")"
+    [[ "$name" =~ -pr([0-9]+)$ ]] || continue
+    pr_number="${BASH_REMATCH[1]}"
+
+    if [ ! -d "$dir/.git" ]; then
+      unknown+=("${name}|not a git repository")
+      continue
+    fi
+
+    remote_url="$(git -C "$dir" remote get-url origin 2>/dev/null || true)"
+    repo_slug="$(parse_repo_slug "$remote_url")"
+    if [ -z "$repo_slug" ]; then
+      unknown+=("${name}|no GitHub remote found")
+      continue
+    fi
+
+    info="$(gh pr view "$pr_number" --repo "$repo_slug" --json state,title --jq '.state + "\t" + .title' 2>/dev/null || true)"
+    if [ -z "$info" ]; then
+      unknown+=("${name}|could not fetch PR ${repo_slug}#${pr_number}")
+      continue
+    fi
+    state="${info%%$'\t'*}"
+    title="${info#*$'\t'}"
+
+    local stale=0
+    if [ "$days" -gt 0 ]; then
+      if [ -z "$(find "$dir" -maxdepth 0 -mtime -"$days" 2>/dev/null)" ]; then
+        stale=1
+      fi
+    fi
+
+    if [ "$state" = "MERGED" ] || [ "$state" = "CLOSED" ] || [ "$stale" -eq 1 ]; then
+      if workdir_is_dirty "$dir"; then
+        reason="uncommitted changes or stashes"
+        skipped+=("${name}|${state} ${repo_slug}#${pr_number} (${reason})")
+      else
+        to_delete+=("${dir}|${repo_slug} #${pr_number}|${state}|${title}")
+      fi
+    else
+      kept+=("${name}|${state} ${repo_slug}#${pr_number}")
+    fi
+  done
+
+  # ----- Report -----
+  local delete_label="PR merged/closed"
+  [ "$days" -gt 0 ] && delete_label="PR merged/closed or not modified for ${days}+ days"
+  echo ""
+  if [ "${#to_delete[@]}" -gt 0 ]; then
+    echo "To delete (${delete_label}):"
+    local entry d slug st tt
+    for entry in "${to_delete[@]}"; do
+      IFS='|' read -r d slug st tt <<<"$entry"
+      printf '  [%s] %-40s %s  %s\n' "$st" "$(basename "$d")" "$slug" "$tt"
+    done
+    echo ""
+  fi
+  if [ "${#skipped[@]}" -gt 0 ]; then
+    echo "Skipped (local work would be lost):"
+    local s
+    for s in "${skipped[@]}"; do printf '  %s\n' "${s/|/  }"; done
+    echo ""
+  fi
+  if [ "${#unknown[@]}" -gt 0 ]; then
+    echo "Unknown (PR state undetermined, kept):"
+    local u
+    for u in "${unknown[@]}"; do printf '  %s\n' "${u/|/  }"; done
+    echo ""
+  fi
+  if [ "${#kept[@]}" -gt 0 ]; then
+    echo "Kept (PR still open):"
+    local k
+    for k in "${kept[@]}"; do printf '  %s\n' "${k/|/  }"; done
+    echo ""
+  fi
+
+  if [ "${#to_delete[@]}" -eq 0 ]; then
+    echo "Nothing to delete."
+    return 0
+  fi
+
+  # Total size of deletion candidates.
+  local total_size paths=()
+  local entry d
+  for entry in "${to_delete[@]}"; do
+    d="${entry%%|*}"
+    paths+=("$d")
+  done
+  total_size="$(du -sh -c "${paths[@]}" 2>/dev/null | tail -1 | cut -f1 || true)"
+
+  echo "${#to_delete[@]} directory(ies) to delete${total_size:+ (~${total_size})}."
+
+  if [ "$dry_run" -eq 1 ]; then
+    echo "(dry-run) No directories were removed."
+    return 0
+  fi
+
+  if [ "$assume_yes" -ne 1 ]; then
+    local answer
+    printf "Proceed with deletion? [y/N] "
+    read -r answer || answer=""
+    case "$answer" in
+      y|Y|yes|YES) ;;
+      *) echo "Aborted. No directories were removed."; return 0 ;;
+    esac
+  fi
+
+  local removed=0
+  for d in "${paths[@]}"; do
+    echo "  removing ${d}"
+    rm -rf "$d"
+    removed=$((removed + 1))
+  done
+  echo "==> Removed ${removed} directory(ies)."
+}
+
+# ---- Subcommand dispatch ----
+if [ $# -ge 1 ] && { [ "$1" = "update" ] || [ "$1" = "self-update" ] || [ "$1" = "upgrade" ]; }; then
+  update_self
+  exit $?
+fi
+
+if [ $# -ge 1 ] && [ "$1" = "create" ]; then
+  shift
+  create_branch "$@"
+  exit $?
+fi
+
+if [ $# -ge 1 ] && { [ "$1" = "clean" ] || [ "$1" = "prune" ]; }; then
+  shift
+  clean_workdirs "$@"
+  exit 0
+fi
+
+# Parse arguments - support both URL and separate arguments
+if [ $# -eq 1 ]; then
+  # Single argument - assume it's a GitHub PR URL
+  url="$1"
+  if [[ "$url" =~ ^https?://github\.com/([^/]+/[^/]+)/pull/([0-9]+) ]]; then
+    repo="${BASH_REMATCH[1]}"
+    pr_number="${BASH_REMATCH[2]}"
+  else
+    echo "Error: Invalid GitHub PR URL format" >&2
+    echo "Expected: https://github.com/owner/repo/pull/<number>" >&2
+    echo "" >&2
+    print_usage
+    exit 1
+  fi
+elif [ $# -eq 2 ]; then
+  # Two arguments - original format
+  pr_number="$1"
+  repo="$2"
+else
+  print_usage
+  exit 1
+fi
+
+mkdir -p "${base_dir}"
+
+repo_name="${repo##*/}"
+work_dir="${base_dir}/${repo_name}-pr${pr_number}"
+
+echo "==> Use workdir: ${work_dir}"
+
+if [ ! -d "${work_dir}/.git" ]; then
+  echo "==> No git repo found in ${work_dir}. Cloning via gh repo clone..."
+  rm -rf "${work_dir}"
+  cd "${base_dir}"
+  gh repo clone "${repo}" "${work_dir}"
+else
+  echo "==> Existing git repo found in ${work_dir}"
+fi
+
+cd "${work_dir}"
+
+echo "==> Running: gh pr checkout ${pr_number} --repo ${repo}"
+gh pr checkout "${pr_number}" --repo "${repo}"

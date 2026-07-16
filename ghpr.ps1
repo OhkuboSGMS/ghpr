@@ -7,7 +7,9 @@
 # Usage:
 #   ghpr <pr-number> <owner/repo>
 #   ghpr <github-pr-url>
+#   ghpr create <owner/repo|repo-url> <branch>
 #   ghpr clean [-DryRun] [-Yes] [-Days <N>]
+#   ghpr update
 
 # Return $true if the repository has work that could be lost on deletion
 # (uncommitted changes or stashed work).
@@ -162,6 +164,131 @@ function Invoke-GhprClean {
     Write-Host "==> Removed $removed directory(ies)."
 }
 
+# Clone <repo> and create <branch> off the latest default branch.
+# Mirrors the layout of PR checkout dirs: ~/work/prs/<repo>-<branch>/
+function Invoke-GhprCreate {
+    param(
+        [Parameter(Mandatory)][string]$Repo,
+        [Parameter(Mandatory)][string]$Branch
+    )
+
+    if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
+        Write-Error "GitHub CLI (gh) is required for 'ghpr create'. Install it from: https://cli.github.com/"
+        return
+    }
+
+    # Normalize repo argument to an "owner/repo" slug
+    $repoSlug = $null
+    if ($Repo -match 'github\.com[:/]+([^/]+)/([^/]+)') {
+        $repoSlug = "$($Matches[1])/$($Matches[2] -replace '\.git$', '')"
+    }
+    else {
+        $repoSlug = $Repo -replace '\.git$', ''
+    }
+
+    $repoName  = $repoSlug.Split('/')[-1]
+    $branchDir = $Branch -replace '/', '-'   # flatten slashes for the dir name
+    $baseDir   = Join-Path $HOME "work\prs"
+    $workDir   = Join-Path $baseDir "$repoName-$branchDir"
+
+    if (-not (Test-Path $baseDir)) {
+        New-Item -ItemType Directory -Force -Path $baseDir | Out-Null
+    }
+
+    Write-Host "==> Use workdir: $workDir"
+
+    if (-not (Test-Path (Join-Path $workDir ".git"))) {
+        Write-Host "==> No git repo found in $workDir. Cloning via gh repo clone..."
+        if (Test-Path $workDir) {
+            Remove-Item -Recurse -Force $workDir
+        }
+        gh repo clone $repoSlug $workDir
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "gh repo clone failed"
+            return
+        }
+    }
+    else {
+        Write-Host "==> Existing git repo found in $workDir"
+    }
+
+    Set-Location $workDir
+
+    # Resolve default branch from GitHub, fall back to local HEAD, then 'main'
+    $defaultBranch = (gh repo view $repoSlug --json defaultBranchRef --jq '.defaultBranchRef.name' 2>$null)
+    if (-not $defaultBranch) {
+        $defaultBranch = (git symbolic-ref --short refs/remotes/origin/HEAD 2>$null) -replace '^origin/', ''
+    }
+    if (-not $defaultBranch) { $defaultBranch = 'main' }
+
+    Write-Host "==> Fetching latest origin/$defaultBranch..."
+    git fetch origin $defaultBranch
+
+    git show-ref --verify --quiet "refs/heads/$Branch" 2>$null
+    $localExists = ($LASTEXITCODE -eq 0)
+
+    if ($localExists) {
+        Write-Host "==> Branch '$Branch' already exists locally; checking it out"
+        git checkout $Branch
+    }
+    else {
+        git show-ref --verify --quiet "refs/remotes/origin/$Branch" 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "Note: a remote branch 'origin/$Branch' already exists." -ForegroundColor Yellow
+            Write-Host "      Creating a fresh local branch from origin/$defaultBranch as requested." -ForegroundColor Yellow
+        }
+        Write-Host "==> Creating branch '$Branch' from origin/$defaultBranch"
+        # --no-track: leave upstream unset until the user pushes the branch
+        git checkout -b $Branch --no-track "origin/$defaultBranch"
+    }
+}
+
+# Download the latest ghpr.ps1 from GitHub and replace the installed copy.
+function Invoke-GhprUpdate {
+    $ghprRepo   = if ($env:GHPR_REPO)   { $env:GHPR_REPO }   else { 'OhkuboSGMS/ghpr' }
+    $ghprBranch = if ($env:GHPR_BRANCH) { $env:GHPR_BRANCH } else { 'master' }
+
+    if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
+        Write-Error "GitHub CLI (gh) is required for 'ghpr update'. Install it from: https://cli.github.com/"
+        return
+    }
+
+    $binDir = Join-Path $HOME ".local\bin"
+    $target = Join-Path $binDir "ghpr.ps1"
+
+    if (-not (Test-Path $target)) {
+        Write-Error "Installed ghpr.ps1 not found at $target. Run install.ps1 first."
+        return
+    }
+
+    Write-Host "==> Updating ghpr from ${ghprRepo}@${ghprBranch}..."
+
+    $tmpFile = Join-Path $binDir ".ghpr-update-tmp.ps1"
+    try {
+        $b64 = gh api "repos/${ghprRepo}/contents/ghpr.ps1?ref=${ghprBranch}" --jq '.content' 2>$null
+        if (-not $b64) {
+            Write-Error "Failed to download ghpr.ps1 from ${ghprRepo}@${ghprBranch}"
+            return
+        }
+        $bytes = [Convert]::FromBase64String($b64)
+        [IO.File]::WriteAllBytes($tmpFile, $bytes)
+
+        if ((Get-Item $tmpFile).Length -eq 0) {
+            Write-Error "Downloaded ghpr.ps1 is empty; aborting (nothing was changed)"
+            Remove-Item $tmpFile -Force
+            return
+        }
+
+        Move-Item -Path $tmpFile -Destination $target -Force
+        Write-Host "==> Updated $target" -ForegroundColor Green
+        Write-Host "    Reload the function to pick up changes: . `$PROFILE  (or open a new shell)"
+    }
+    catch {
+        Write-Error "Update failed: $_"
+        if (Test-Path $tmpFile) { Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue }
+    }
+}
+
 function ghpr {
     [CmdletBinding()]
     param(
@@ -170,6 +297,9 @@ function ghpr {
 
         [Parameter(Position = 1)]
         [string]$Second,
+
+        [Parameter(Position = 2)]
+        [string]$Third,
 
         [switch]$DryRun,
         [switch]$Yes,
@@ -180,16 +310,36 @@ function ghpr {
 Usage:
   ghpr <pr-number> <owner/repo>
   ghpr <github-pr-url>
+  ghpr create <owner/repo|repo-url> <branch>
   ghpr clean [-DryRun] [-Yes] [-Days <N>]
+  ghpr update
 
 Examples:
   ghpr 125 octocat/Hello-World
   ghpr https://github.com/octocat/Hello-World/pull/125
+  ghpr create octocat/Hello-World feature/login
   ghpr clean            # remove work dirs whose PR is merged/closed
   ghpr clean -DryRun    # list candidates without deleting
+  ghpr update           # update ghpr itself to the latest version
 "@
 
     $baseDir = Join-Path $HOME "work\prs"
+
+    # Subcommand: update / self-update / upgrade
+    if ($First -eq 'update' -or $First -eq 'self-update' -or $First -eq 'upgrade') {
+        Invoke-GhprUpdate
+        return
+    }
+
+    # Subcommand: create
+    if ($First -eq 'create') {
+        if (-not $Second -or -not $Third) {
+            Write-Host "Usage: ghpr create <owner/repo|repo-url> <branch>"
+            return
+        }
+        Invoke-GhprCreate -Repo $Second -Branch $Third
+        return
+    }
 
     # Subcommand: clean / prune (does not change the current directory)
     if ($First -eq 'clean' -or $First -eq 'prune') {

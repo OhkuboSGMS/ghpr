@@ -138,6 +138,8 @@ print_clean_usage() {
   echo "Usage: ghpr clean [options]" >&2
   echo "" >&2
   echo "Remove work directories under ${base_dir} whose PR is merged or closed." >&2
+  echo "Covers both PR checkout dirs (<repo>-pr<number>) and 'ghpr create' dirs" >&2
+  echo "(<repo>-<branch>, matched to a PR by the dir's current branch)." >&2
   echo "Directories with uncommitted changes or stashes are always kept." >&2
   echo "" >&2
   echo "Options:" >&2
@@ -170,6 +172,47 @@ workdir_is_dirty() {
     return 0
   fi
   return 1
+}
+
+# Return 0 (true) if the current HEAD commit exists on some remote-tracking
+# branch (i.e. it has been pushed somewhere). Used to protect a `ghpr create`
+# branch whose commits are local-only from being deleted.
+branch_is_pushed() {
+  local dir="$1"
+  [ -n "$(git -C "$dir" branch -r --contains HEAD 2>/dev/null)" ]
+}
+
+# Resolve the PR state for a `ghpr create` work dir by looking up the PR whose
+# head is the dir's current branch. Prints "STATE\tNUMBER\tTITLE" for the most
+# relevant PR (an OPEN one wins; else MERGED; else CLOSED), or nothing when the
+# branch has no PR at all. $2 receives the resolved branch name back.
+resolve_create_pr() {
+  local dir="$1" slug="$2"
+  local branch
+  branch="$(git -C "$dir" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+  printf '%s\n' "$branch"   # first line: branch (empty if detached)
+  [ -z "$branch" ] && return 0
+
+  local prlist
+  prlist="$(gh pr list --repo "$slug" --head "$branch" --state all \
+              --json number,state,title \
+              --jq '.[] | .state + "\t" + (.number|tostring) + "\t" + .title' \
+              2>/dev/null || true)"
+  [ -z "$prlist" ] && return 0
+
+  local line pstate pnum ptitle
+  local pick_state="" pick_num="" pick_title=""
+  while IFS=$'\t' read -r pstate pnum ptitle; do
+    [ -z "$pstate" ] && continue
+    if [ "$pstate" = "OPEN" ]; then
+      pick_state="OPEN"; pick_num="$pnum"; pick_title="$ptitle"; break
+    fi
+    if [ -z "$pick_state" ] || { [ "$pstate" = "MERGED" ] && [ "$pick_state" = "CLOSED" ]; }; then
+      pick_state="$pstate"; pick_num="$pnum"; pick_title="$ptitle"
+    fi
+  done <<<"$prlist"
+
+  printf '%s\t%s\t%s\n' "$pick_state" "$pick_num" "$pick_title"
 }
 
 clean_workdirs() {
@@ -210,13 +253,14 @@ clean_workdirs() {
   local kept=()         # "dir|state"
   local unknown=()      # "dir|reason"
 
-  local dir name pr_number remote_url repo_slug info state title reason
+  # Scan every work dir. Two naming schemes are handled:
+  #   <repo>-pr<number>   PR checkout dir  -> look the PR up by number
+  #   <repo>-<branch>     `ghpr create` dir -> look the PR up by head branch
+  local dir name remote_url repo_slug state title pr_label reason is_create
   shopt -s nullglob
-  for dir in "$base_dir"/*-pr*; do
+  for dir in "$base_dir"/*; do
     [ -d "$dir" ] || continue
     name="$(basename "$dir")"
-    [[ "$name" =~ -pr([0-9]+)$ ]] || continue
-    pr_number="${BASH_REMATCH[1]}"
 
     if [ ! -d "$dir/.git" ]; then
       unknown+=("${name}|not a git repository")
@@ -230,13 +274,39 @@ clean_workdirs() {
       continue
     fi
 
-    info="$(gh pr view "$pr_number" --repo "$repo_slug" --json state,title --jq '.state + "\t" + .title' 2>/dev/null || true)"
-    if [ -z "$info" ]; then
-      unknown+=("${name}|could not fetch PR ${repo_slug}#${pr_number}")
-      continue
+    state=""; title=""; pr_label=""; is_create=0
+    if [[ "$name" =~ -pr([0-9]+)$ ]]; then
+      # ----- PR checkout dir -----
+      local pr_number="${BASH_REMATCH[1]}"
+      pr_label="#${pr_number}"
+      local info
+      info="$(gh pr view "$pr_number" --repo "$repo_slug" --json state,title --jq '.state + "\t" + .title' 2>/dev/null || true)"
+      if [ -z "$info" ]; then
+        unknown+=("${name}|could not fetch PR ${repo_slug}#${pr_number}")
+        continue
+      fi
+      state="${info%%$'\t'*}"
+      title="${info#*$'\t'}"
+    else
+      # ----- `ghpr create` dir: resolve the PR from the current branch -----
+      is_create=1
+      local resolved branch pr_line pick_state pick_num pick_title
+      resolved="$(resolve_create_pr "$dir" "$repo_slug")"
+      branch="$(printf '%s\n' "$resolved" | sed -n '1p')"
+      pr_line="$(printf '%s\n' "$resolved" | sed -n '2p')"
+      if [ -z "$branch" ]; then
+        unknown+=("${name}|detached HEAD (no branch)")
+        continue
+      fi
+      if [ -z "$pr_line" ]; then
+        unknown+=("${name}|no PR for branch '${branch}' (local-only)")
+        continue
+      fi
+      IFS=$'\t' read -r pick_state pick_num pick_title <<<"$pr_line"
+      state="$pick_state"
+      title="$pick_title"
+      pr_label="#${pick_num} (branch ${branch})"
     fi
-    state="${info%%$'\t'*}"
-    title="${info#*$'\t'}"
 
     local stale=0
     if [ "$days" -gt 0 ]; then
@@ -246,14 +316,21 @@ clean_workdirs() {
     fi
 
     if [ "$state" = "MERGED" ] || [ "$state" = "CLOSED" ] || [ "$stale" -eq 1 ]; then
+      reason=""
       if workdir_is_dirty "$dir"; then
         reason="uncommitted changes or stashes"
-        skipped+=("${name}|${state} ${repo_slug}#${pr_number} (${reason})")
+      elif [ "$is_create" -eq 1 ] && [ "$state" = "CLOSED" ] && ! branch_is_pushed "$dir"; then
+        # A closed (not merged) create branch whose commits live only here:
+        # keep it so the local work is never lost.
+        reason="closed PR, local commits not pushed"
+      fi
+      if [ -n "$reason" ]; then
+        skipped+=("${name}|${state} ${repo_slug}${pr_label:+ ${pr_label}} (${reason})")
       else
-        to_delete+=("${dir}|${repo_slug} #${pr_number}|${state}|${title}")
+        to_delete+=("${dir}|${repo_slug} ${pr_label}|${state}|${title}")
       fi
     else
-      kept+=("${name}|${state} ${repo_slug}#${pr_number}")
+      kept+=("${name}|${state} ${repo_slug} ${pr_label}")
     fi
   done
 

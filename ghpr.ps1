@@ -25,6 +25,47 @@ function Test-GhprDirty {
     return $false
 }
 
+# Return $true if the current HEAD commit exists on some remote-tracking branch
+# (i.e. it has been pushed). Protects a `ghpr create` branch whose commits are
+# local-only from being deleted.
+function Test-GhprBranchPushed {
+    param([Parameter(Mandatory)][string]$Dir)
+
+    $remotes = git -C $Dir branch -r --contains HEAD 2>$null
+    return [bool]$remotes
+}
+
+# Resolve the PR that a `ghpr create` work dir maps to, via its current branch.
+# Returns a hashtable with Branch, plus State/Number/Title of the most relevant
+# PR (OPEN wins, else MERGED, else CLOSED); State is $null when the branch has
+# no PR at all.
+function Resolve-GhprCreatePr {
+    param(
+        [Parameter(Mandatory)][string]$Dir,
+        [Parameter(Mandatory)][string]$RepoSlug
+    )
+
+    $branch = (git -C $Dir symbolic-ref --quiet --short HEAD 2>$null)
+    $result = @{ Branch = $branch; State = $null; Number = $null; Title = $null }
+    if (-not $branch) { return $result }
+
+    $json = (gh pr list --repo $RepoSlug --head $branch --state all --json number, state, title 2>$null) | Out-String
+    if (-not $json.Trim()) { return $result }
+
+    $prs = @($json | ConvertFrom-Json)
+    if ($prs.Count -eq 0) { return $result }
+
+    $pick = $prs | Where-Object { $_.state -eq 'OPEN' } | Select-Object -First 1
+    if (-not $pick) { $pick = $prs | Where-Object { $_.state -eq 'MERGED' } | Select-Object -First 1 }
+    if (-not $pick) { $pick = $prs | Where-Object { $_.state -eq 'CLOSED' } | Select-Object -First 1 }
+    if (-not $pick) { $pick = $prs | Select-Object -First 1 }
+
+    $result.State  = $pick.state
+    $result.Number = $pick.number
+    $result.Title  = $pick.title
+    return $result
+}
+
 # Remove work directories under $BaseDir whose PR is merged or closed.
 function Invoke-GhprClean {
     param(
@@ -54,12 +95,10 @@ function Invoke-GhprClean {
     $cutoff = if ($Days -gt 0) { (Get-Date).AddDays(-$Days) } else { $null }
 
     Get-ChildItem -Path $BaseDir -Directory |
-        Where-Object { $_.Name -match '-pr(\d+)$' } |
         ForEach-Object {
             $dir = $_.FullName
             $name = $_.Name
-            $null = $name -match '-pr(\d+)$'
-            $prNumber = $Matches[1]
+            $lastWrite = $_.LastWriteTime
 
             if (-not (Test-Path (Join-Path $dir '.git'))) {
                 $unknown += [pscustomobject]@{ Name = $name; Reason = 'not a git repository' }
@@ -76,28 +115,57 @@ function Invoke-GhprClean {
                 return
             }
 
-            $json = (gh pr view $prNumber --repo $repoSlug --json state, title 2>$null) | Out-String
-            if (-not $json.Trim()) {
-                $unknown += [pscustomobject]@{ Name = $name; Reason = "could not fetch PR $repoSlug#$prNumber" }
-                return
+            # PR checkout dirs are "<repo>-pr<number>" (look up by number); every
+            # other dir is treated as a `ghpr create` dir (look up by branch).
+            $state = $null; $title = $null; $prLabel = $null; $isCreate = $false
+            if ($name -match '-pr(\d+)$') {
+                $prNumber = $Matches[1]
+                $prLabel = "#$prNumber"
+                $json = (gh pr view $prNumber --repo $repoSlug --json state, title 2>$null) | Out-String
+                if (-not $json.Trim()) {
+                    $unknown += [pscustomobject]@{ Name = $name; Reason = "could not fetch PR $repoSlug#$prNumber" }
+                    return
+                }
+                $pr = $json | ConvertFrom-Json
+                $state = $pr.state
+                $title = $pr.title
             }
-            $pr = $json | ConvertFrom-Json
-            $state = $pr.state
-            $title = $pr.title
+            else {
+                $isCreate = $true
+                $resolved = Resolve-GhprCreatePr -Dir $dir -RepoSlug $repoSlug
+                if (-not $resolved.Branch) {
+                    $unknown += [pscustomobject]@{ Name = $name; Reason = 'detached HEAD (no branch)' }
+                    return
+                }
+                if (-not $resolved.State) {
+                    $unknown += [pscustomobject]@{ Name = $name; Reason = "no PR for branch '$($resolved.Branch)' (local-only)" }
+                    return
+                }
+                $state = $resolved.State
+                $title = $resolved.Title
+                $prLabel = "#$($resolved.Number) (branch $($resolved.Branch))"
+            }
 
             $stale = $false
-            if ($cutoff -and $_.LastWriteTime -lt $cutoff) { $stale = $true }
+            if ($cutoff -and $lastWrite -lt $cutoff) { $stale = $true }
 
             if ($state -eq 'MERGED' -or $state -eq 'CLOSED' -or $stale) {
+                $reason = $null
                 if (Test-GhprDirty -Dir $dir) {
-                    $skipped += [pscustomobject]@{ Name = $name; Info = "$state $repoSlug#$prNumber (uncommitted changes or stashes)" }
+                    $reason = 'uncommitted changes or stashes'
+                }
+                elseif ($isCreate -and $state -eq 'CLOSED' -and -not (Test-GhprBranchPushed -Dir $dir)) {
+                    $reason = 'closed PR, local commits not pushed'
+                }
+                if ($reason) {
+                    $skipped += [pscustomobject]@{ Name = $name; Info = "$state $repoSlug $prLabel ($reason)" }
                 }
                 else {
-                    $toDelete += [pscustomobject]@{ Dir = $dir; Name = $name; Slug = $repoSlug; Pr = $prNumber; State = $state; Title = $title }
+                    $toDelete += [pscustomobject]@{ Dir = $dir; Name = $name; Slug = $repoSlug; PrLabel = $prLabel; State = $state; Title = $title }
                 }
             }
             else {
-                $kept += [pscustomobject]@{ Name = $name; Info = "$state $repoSlug#$prNumber" }
+                $kept += [pscustomobject]@{ Name = $name; Info = "$state $repoSlug $prLabel" }
             }
         }
 
@@ -108,7 +176,7 @@ function Invoke-GhprClean {
     if ($toDelete.Count -gt 0) {
         Write-Host "To delete ($deleteLabel):"
         foreach ($c in $toDelete) {
-            Write-Host ("  [{0}] {1,-40} {2} #{3}  {4}" -f $c.State, $c.Name, $c.Slug, $c.Pr, $c.Title)
+            Write-Host ("  [{0}] {1,-40} {2} {3}  {4}" -f $c.State, $c.Name, $c.Slug, $c.PrLabel, $c.Title)
         }
         Write-Host ""
     }

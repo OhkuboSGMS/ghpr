@@ -125,14 +125,25 @@ ghpr clean --days 30    # also flag dirs not modified for 30+ days
 ```
 
 A work directory is considered **unused** when its PR is **merged or closed**
-(determined via `gh`, using each clone's `origin` remote and the PR number in
-the folder name). For safety:
+(determined via `gh`, using each clone's `origin` remote). This covers both
+kinds of work dir:
+
+- **PR checkout dirs** (`<repo>-pr<number>`) — matched by the PR number in the
+  folder name.
+- **`ghpr create` dirs** (`<repo>-<branch>`) — matched by looking up the PR
+  whose head is the dir's current branch. A `create` branch that has **no PR
+  yet** (e.g. never pushed) is kept, so you never lose local-only work.
+
+For safety:
 
 - Directories with **uncommitted changes or stashes are always kept**, even if
   the PR is merged/closed — so you never lose local work.
+- A `create` dir whose PR is **closed (not merged)** is kept when its commits
+  were never pushed anywhere — the local clone may be the only copy.
 - Directories whose PR is still **open** are kept.
 - Directories whose state can't be determined (not a git repo, no GitHub
-  remote, or `gh` can't reach the PR) are kept and listed under *Unknown*.
+  remote, detached HEAD, a branch with no PR, or `gh` can't reach the PR) are
+  kept and listed under *Unknown*.
 
 Deletion is interactive by default: candidates are listed with their total
 size, and nothing is removed until you confirm. `prune` is accepted as an alias

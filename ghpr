@@ -12,7 +12,7 @@ print_usage() {
   echo "  ghpr <pr-number> <owner/repo>" >&2
   echo "  ghpr <github-pr-url>" >&2
   echo "  ghpr create <owner/repo|repo-url> <branch>" >&2
-  echo "  ghpr clean [-n|--dry-run] [-y|--yes] [--days <N>]" >&2
+  echo "  ghpr clean [-n|--dry-run] [-y|--yes] [--days <N>] [-o|--open]" >&2
   echo "  ghpr update" >&2
   echo "" >&2
   echo "Examples:" >&2
@@ -21,6 +21,7 @@ print_usage() {
   echo "  ghpr create octocat/Hello-World feature/login" >&2
   echo "  ghpr clean            # remove work dirs whose PR is merged/closed" >&2
   echo "  ghpr clean --dry-run  # list candidates without deleting" >&2
+  echo "  ghpr clean --open     # open skipped (dirty) work dirs in VS Code" >&2
   echo "  ghpr update           # update ghpr itself to the latest version" >&2
 }
 
@@ -146,7 +147,106 @@ print_clean_usage() {
   echo "  -n, --dry-run   List deletion candidates without removing anything" >&2
   echo "  -y, --yes       Delete without the interactive confirmation prompt" >&2
   echo "      --days <N>  Also flag dirs not modified for N+ days (default: off)" >&2
+  echo "  -o, --open      Open every skipped (dirty) dir in the editor, no prompt" >&2
   echo "  -h, --help      Show this help" >&2
+  echo "" >&2
+  echo "When dirs are skipped, ghpr offers to open them in VS Code so you can" >&2
+  echo "commit/discard the leftover work and re-run clean." >&2
+  echo "Editor override: GHPR_EDITOR (default: code, cursor, code-insiders, codium)" >&2
+}
+
+# Print the editor command used to open work dirs, or nothing when none is
+# available. GHPR_EDITOR wins so users can plug in their own (it may include
+# arguments, e.g. GHPR_EDITOR="code -n").
+resolve_editor() {
+  if [ -n "${GHPR_EDITOR:-}" ]; then
+    printf '%s\n' "$GHPR_EDITOR"
+    return 0
+  fi
+  local candidate
+  for candidate in code cursor code-insiders codium; do
+    if command -v "$candidate" &>/dev/null; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Open the given directories in the editor. Falls back to the macOS app bundle
+# when the `code` CLI isn't on PATH (VS Code installs it only on request).
+open_in_editor() {
+  [ $# -eq 0 ] && return 0
+
+  local editor d
+  if editor="$(resolve_editor)"; then
+    for d in "$@"; do
+      echo "  opening ${d}  (${editor})"
+      # Unquoted on purpose: GHPR_EDITOR may carry arguments.
+      # shellcheck disable=SC2086
+      $editor "$d" || echo "  Warning: failed to open ${d}" >&2
+    done
+    return 0
+  fi
+
+  if [ "$(uname -s)" = "Darwin" ] && [ -d "/Applications/Visual Studio Code.app" ]; then
+    for d in "$@"; do
+      echo "  opening ${d}  (Visual Studio Code.app)"
+      open -a "Visual Studio Code" "$d" || echo "  Warning: failed to open ${d}" >&2
+    done
+    return 0
+  fi
+
+  echo "Error: no editor found. Install the VS Code 'code' command" >&2
+  echo "       (Command Palette > 'Shell Command: Install code command in PATH')" >&2
+  echo "       or set GHPR_EDITOR to the command you want to use." >&2
+  return 1
+}
+
+# Offer to open the skipped work dirs so the user can deal with the leftover
+# local work. Arguments are the skipped directory paths, in report order.
+# $auto_open / $assume_yes from the caller control whether we prompt.
+offer_open_skipped() {
+  [ $# -eq 0 ] && return 0
+  local dirs=("$@")
+
+  if [ "${auto_open:-0}" -eq 1 ]; then
+    echo "Opening ${#dirs[@]} skipped directory(ies) in the editor..."
+    open_in_editor "${dirs[@]}"
+    return $?
+  fi
+
+  # Non-interactive runs (-y, or no tty) must not block on a prompt.
+  [ "${assume_yes:-0}" -eq 1 ] && return 0
+  [ -t 0 ] || return 0
+
+  local answer
+  printf "Open skipped dir(s) in the editor? [a]ll / numbers (e.g. 1 3) / [N]o: "
+  read -r answer || answer=""
+
+  case "$answer" in
+    a|A|all|ALL|y|Y|yes|YES)
+      open_in_editor "${dirs[@]}"
+      ;;
+    ""|n|N|no|NO)
+      return 0
+      ;;
+    *)
+      local picked=() idx
+      for idx in $answer; do
+        if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -lt 1 ] || [ "$idx" -gt "${#dirs[@]}" ]; then
+          echo "Ignoring invalid selection: ${idx}" >&2
+          continue
+        fi
+        picked+=("${dirs[$((idx - 1))]}")   # the list is printed 1-based
+      done
+      if [ "${#picked[@]}" -eq 0 ]; then
+        echo "Nothing selected."
+        return 0
+      fi
+      open_in_editor "${picked[@]}"
+      ;;
+  esac
 }
 
 # Parse "owner/repo" out of a git remote URL (https or ssh form).
@@ -216,11 +316,12 @@ resolve_create_pr() {
 }
 
 clean_workdirs() {
-  local dry_run=0 assume_yes=0 days=0
+  local dry_run=0 assume_yes=0 days=0 auto_open=0
   while [ $# -gt 0 ]; do
     case "$1" in
       -n|--dry-run) dry_run=1 ;;
       -y|--yes) assume_yes=1 ;;
+      -o|--open) auto_open=1 ;;
       --days)
         shift
         if [ $# -eq 0 ] || ! [[ "${1:-}" =~ ^[0-9]+$ ]]; then
@@ -250,6 +351,7 @@ clean_workdirs() {
 
   local to_delete=()    # "dir|repo #pr|state|title"
   local skipped=()      # "dir|reason"
+  local skipped_dirs=() # full paths, same order as skipped (for --open)
   local kept=()         # "dir|state"
   local unknown=()      # "dir|reason"
 
@@ -326,6 +428,7 @@ clean_workdirs() {
       fi
       if [ -n "$reason" ]; then
         skipped+=("${name}|${state} ${repo_slug}${pr_label:+ ${pr_label}} (${reason})")
+        skipped_dirs+=("$dir")
       else
         to_delete+=("${dir}|${repo_slug} ${pr_label}|${state}|${title}")
       fi
@@ -349,8 +452,11 @@ clean_workdirs() {
   fi
   if [ "${#skipped[@]}" -gt 0 ]; then
     echo "Skipped (local work would be lost):"
-    local s
-    for s in "${skipped[@]}"; do printf '  %s\n' "${s/|/  }"; done
+    local i s
+    for i in "${!skipped[@]}"; do
+      s="${skipped[$i]}"
+      printf '  %d) %s\n' "$((i + 1))" "${s/|/  }"
+    done
     echo ""
   fi
   if [ "${#unknown[@]}" -gt 0 ]; then
@@ -366,44 +472,53 @@ clean_workdirs() {
     echo ""
   fi
 
+  # ----- Deletion -----
+  # Kept in one block (rather than early returns) so the "open skipped dirs"
+  # step below runs on every path, including "nothing to delete".
   if [ "${#to_delete[@]}" -eq 0 ]; then
     echo "Nothing to delete."
-    return 0
+  else
+    # Total size of deletion candidates.
+    local total_size paths=()
+    local entry d
+    for entry in "${to_delete[@]}"; do
+      d="${entry%%|*}"
+      paths+=("$d")
+    done
+    total_size="$(du -sh -c "${paths[@]}" 2>/dev/null | tail -1 | cut -f1 || true)"
+
+    echo "${#to_delete[@]} directory(ies) to delete${total_size:+ (~${total_size})}."
+
+    local proceed=1
+    if [ "$dry_run" -eq 1 ]; then
+      echo "(dry-run) No directories were removed."
+      proceed=0
+    elif [ "$assume_yes" -ne 1 ]; then
+      local answer
+      printf "Proceed with deletion? [y/N] "
+      read -r answer || answer=""
+      case "$answer" in
+        y|Y|yes|YES) ;;
+        *) echo "Aborted. No directories were removed."; proceed=0 ;;
+      esac
+    fi
+
+    if [ "$proceed" -eq 1 ]; then
+      local removed=0
+      for d in "${paths[@]}"; do
+        echo "  removing ${d}"
+        rm -rf "$d"
+        removed=$((removed + 1))
+      done
+      echo "==> Removed ${removed} directory(ies)."
+    fi
   fi
 
-  # Total size of deletion candidates.
-  local total_size paths=()
-  local entry d
-  for entry in "${to_delete[@]}"; do
-    d="${entry%%|*}"
-    paths+=("$d")
-  done
-  total_size="$(du -sh -c "${paths[@]}" 2>/dev/null | tail -1 | cut -f1 || true)"
-
-  echo "${#to_delete[@]} directory(ies) to delete${total_size:+ (~${total_size})}."
-
-  if [ "$dry_run" -eq 1 ]; then
-    echo "(dry-run) No directories were removed."
-    return 0
+  # ----- Follow-up: hand the skipped dirs to the editor -----
+  if [ "${#skipped_dirs[@]}" -gt 0 ]; then
+    echo ""
+    offer_open_skipped "${skipped_dirs[@]}"
   fi
-
-  if [ "$assume_yes" -ne 1 ]; then
-    local answer
-    printf "Proceed with deletion? [y/N] "
-    read -r answer || answer=""
-    case "$answer" in
-      y|Y|yes|YES) ;;
-      *) echo "Aborted. No directories were removed."; return 0 ;;
-    esac
-  fi
-
-  local removed=0
-  for d in "${paths[@]}"; do
-    echo "  removing ${d}"
-    rm -rf "$d"
-    removed=$((removed + 1))
-  done
-  echo "==> Removed ${removed} directory(ies)."
 }
 
 # ---- Subcommand dispatch ----

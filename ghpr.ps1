@@ -8,7 +8,7 @@
 #   ghpr <pr-number> <owner/repo>
 #   ghpr <github-pr-url>
 #   ghpr create <owner/repo|repo-url> <branch>
-#   ghpr clean [-DryRun] [-Yes] [-Days <N>]
+#   ghpr clean [-DryRun] [-Yes] [-Days <N>] [-Open]
 #   ghpr update
 
 # Return $true if the repository has work that could be lost on deletion
@@ -33,6 +33,77 @@ function Test-GhprBranchPushed {
 
     $remotes = git -C $Dir branch -r --contains HEAD 2>$null
     return [bool]$remotes
+}
+
+# Return the editor command used to open work dirs, or $null when none is
+# available. GHPR_EDITOR wins so users can plug in their own.
+function Get-GhprEditor {
+    if ($env:GHPR_EDITOR) { return $env:GHPR_EDITOR }
+    foreach ($candidate in @('code', 'cursor', 'code-insiders', 'codium')) {
+        if (Get-Command $candidate -ErrorAction SilentlyContinue) { return $candidate }
+    }
+    return $null
+}
+
+# Open the given directories in the editor.
+function Open-GhprDirs {
+    param([string[]]$Dirs)
+
+    if (-not $Dirs -or $Dirs.Count -eq 0) { return }
+
+    $editor = Get-GhprEditor
+    if (-not $editor) {
+        Write-Error ("No editor found. Install the VS Code 'code' command " +
+            "(Command Palette > 'Shell Command: Install code command in PATH') " +
+            "or set GHPR_EDITOR to the command you want to use.")
+        return
+    }
+
+    foreach ($d in $Dirs) {
+        Write-Host "  opening $d  ($editor)"
+        try { & $editor $d }
+        catch { Write-Warning "failed to open $d" }
+    }
+}
+
+# Offer to open the skipped work dirs so the user can deal with the leftover
+# local work. -AutoOpen skips the prompt; -Yes suppresses it entirely.
+function Invoke-GhprOpenSkipped {
+    param(
+        [string[]]$Dirs,
+        [switch]$AutoOpen,
+        [switch]$NoPrompt
+    )
+
+    if (-not $Dirs -or $Dirs.Count -eq 0) { return }
+
+    if ($AutoOpen) {
+        Write-Host "Opening $($Dirs.Count) skipped directory(ies) in the editor..."
+        Open-GhprDirs -Dirs $Dirs
+        return
+    }
+    if ($NoPrompt) { return }
+
+    $answer = Read-Host "Open skipped dir(s) in the editor? [a]ll / numbers (e.g. 1 3) / [N]o"
+    if ($answer -match '^(a|all|y|yes)$') {
+        Open-GhprDirs -Dirs $Dirs
+        return
+    }
+    if (-not $answer -or $answer -match '^(n|no)$') { return }
+
+    $picked = @()
+    foreach ($token in ($answer -split '\s+' | Where-Object { $_ })) {
+        if ($token -notmatch '^\d+$' -or [int]$token -lt 1 -or [int]$token -gt $Dirs.Count) {
+            Write-Warning "Ignoring invalid selection: $token"
+            continue
+        }
+        $picked += $Dirs[[int]$token - 1]   # the list is printed 1-based
+    }
+    if ($picked.Count -eq 0) {
+        Write-Host "Nothing selected."
+        return
+    }
+    Open-GhprDirs -Dirs $picked
 }
 
 # Resolve the PR that a `ghpr create` work dir maps to, via its current branch.
@@ -72,7 +143,8 @@ function Invoke-GhprClean {
         [Parameter(Mandatory)][string]$BaseDir,
         [switch]$DryRun,
         [switch]$Yes,
-        [int]$Days = 0
+        [int]$Days = 0,
+        [switch]$Open
     )
 
     if (-not (Test-Path $BaseDir)) {
@@ -158,7 +230,7 @@ function Invoke-GhprClean {
                     $reason = 'closed PR, local commits not pushed'
                 }
                 if ($reason) {
-                    $skipped += [pscustomobject]@{ Name = $name; Info = "$state $repoSlug $prLabel ($reason)" }
+                    $skipped += [pscustomobject]@{ Name = $name; Dir = $dir; Info = "$state $repoSlug $prLabel ($reason)" }
                 }
                 else {
                     $toDelete += [pscustomobject]@{ Dir = $dir; Name = $name; Slug = $repoSlug; PrLabel = $prLabel; State = $state; Title = $title }
@@ -182,7 +254,9 @@ function Invoke-GhprClean {
     }
     if ($skipped.Count -gt 0) {
         Write-Host "Skipped (local work would be lost):"
-        foreach ($s in $skipped) { Write-Host "  $($s.Name)  $($s.Info)" }
+        for ($i = 0; $i -lt $skipped.Count; $i++) {
+            Write-Host "  $($i + 1)) $($skipped[$i].Name)  $($skipped[$i].Info)"
+        }
         Write-Host ""
     }
     if ($unknown.Count -gt 0) {
@@ -196,40 +270,51 @@ function Invoke-GhprClean {
         Write-Host ""
     }
 
+    # ----- Deletion -----
+    # Kept in one block (rather than early returns) so the "open skipped dirs"
+    # step below runs on every path, including "nothing to delete".
     if ($toDelete.Count -eq 0) {
         Write-Host "Nothing to delete."
-        return
     }
+    else {
+        $totalBytes = 0
+        foreach ($c in $toDelete) {
+            $sum = (Get-ChildItem -LiteralPath $c.Dir -Recurse -Force -File -ErrorAction SilentlyContinue |
+                Measure-Object -Property Length -Sum).Sum
+            if ($sum) { $totalBytes += $sum }
+        }
+        $totalMb = [math]::Round($totalBytes / 1MB, 1)
+        Write-Host "$($toDelete.Count) directory(ies) to delete (~${totalMb} MB)."
 
-    $totalBytes = 0
-    foreach ($c in $toDelete) {
-        $sum = (Get-ChildItem -LiteralPath $c.Dir -Recurse -Force -File -ErrorAction SilentlyContinue |
-            Measure-Object -Property Length -Sum).Sum
-        if ($sum) { $totalBytes += $sum }
-    }
-    $totalMb = [math]::Round($totalBytes / 1MB, 1)
-    Write-Host "$($toDelete.Count) directory(ies) to delete (~${totalMb} MB)."
+        $proceed = $true
+        if ($DryRun) {
+            Write-Host "(dry-run) No directories were removed."
+            $proceed = $false
+        }
+        elseif (-not $Yes) {
+            $answer = Read-Host "Proceed with deletion? [y/N]"
+            if ($answer -notmatch '^(y|yes)$') {
+                Write-Host "Aborted. No directories were removed."
+                $proceed = $false
+            }
+        }
 
-    if ($DryRun) {
-        Write-Host "(dry-run) No directories were removed."
-        return
-    }
-
-    if (-not $Yes) {
-        $answer = Read-Host "Proceed with deletion? [y/N]"
-        if ($answer -notmatch '^(y|yes)$') {
-            Write-Host "Aborted. No directories were removed."
-            return
+        if ($proceed) {
+            $removed = 0
+            foreach ($c in $toDelete) {
+                Write-Host "  removing $($c.Dir)"
+                Remove-Item -Recurse -Force -LiteralPath $c.Dir
+                $removed++
+            }
+            Write-Host "==> Removed $removed directory(ies)."
         }
     }
 
-    $removed = 0
-    foreach ($c in $toDelete) {
-        Write-Host "  removing $($c.Dir)"
-        Remove-Item -Recurse -Force -LiteralPath $c.Dir
-        $removed++
+    # ----- Follow-up: hand the skipped dirs to the editor -----
+    if ($skipped.Count -gt 0) {
+        Write-Host ""
+        Invoke-GhprOpenSkipped -Dirs @($skipped.Dir) -AutoOpen:$Open -NoPrompt:$Yes
     }
-    Write-Host "==> Removed $removed directory(ies)."
 }
 
 # Clone <repo> and create <branch> off the latest default branch.
@@ -371,7 +456,8 @@ function ghpr {
 
         [switch]$DryRun,
         [switch]$Yes,
-        [int]$Days = 0
+        [int]$Days = 0,
+        [switch]$Open
     )
 
     $usage = @"
@@ -379,7 +465,7 @@ Usage:
   ghpr <pr-number> <owner/repo>
   ghpr <github-pr-url>
   ghpr create <owner/repo|repo-url> <branch>
-  ghpr clean [-DryRun] [-Yes] [-Days <N>]
+  ghpr clean [-DryRun] [-Yes] [-Days <N>] [-Open]
   ghpr update
 
 Examples:
@@ -388,6 +474,7 @@ Examples:
   ghpr create octocat/Hello-World feature/login
   ghpr clean            # remove work dirs whose PR is merged/closed
   ghpr clean -DryRun    # list candidates without deleting
+  ghpr clean -Open      # open skipped (dirty) work dirs in VS Code
   ghpr update           # update ghpr itself to the latest version
 "@
 
@@ -411,7 +498,7 @@ Examples:
 
     # Subcommand: clean / prune (does not change the current directory)
     if ($First -eq 'clean' -or $First -eq 'prune') {
-        Invoke-GhprClean -BaseDir $baseDir -DryRun:$DryRun -Yes:$Yes -Days $Days
+        Invoke-GhprClean -BaseDir $baseDir -DryRun:$DryRun -Yes:$Yes -Days $Days -Open:$Open
         return
     }
 

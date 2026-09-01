@@ -122,6 +122,7 @@ ghpr clean              # list candidates, then ask before deleting
 ghpr clean --dry-run    # only list candidates, never delete
 ghpr clean --yes        # delete without the confirmation prompt
 ghpr clean --days 30    # also flag dirs not modified for 30+ days
+ghpr clean --open       # open the skipped (dirty) dirs in VS Code
 ```
 
 A work directory is considered **unused** when its PR is **merged or closed**
@@ -149,12 +150,46 @@ Deletion is interactive by default: candidates are listed with their total
 size, and nothing is removed until you confirm. `prune` is accepted as an alias
 for `clean`.
 
+#### Finishing off the skipped directories
+
+Skipped dirs are the ones `clean` can't remove for you — they still hold
+uncommitted changes, untracked files, or stashes. `clean` lists them numbered:
+
+```
+Skipped (local work would be lost):
+  1) Hello-World-pr125  MERGED octocat/Hello-World #125 (uncommitted changes or stashes)
+  2) Spoon-Knife-fix-typo  CLOSED octocat/Spoon-Knife #13 (uncommitted changes or stashes)
+```
+
+and then offers to open them so you can commit or discard the leftovers:
+
+```
+Open skipped dir(s) in the editor? [a]ll / numbers (e.g. 1 3) / [N]o:
+```
+
+Answer `a` to open all of them, a list of numbers (`1 3`) to open just those,
+or press Enter to skip. Once you've dealt with the leftover work, re-run
+`ghpr clean` and those dirs become deletable.
+
+`--open` opens every skipped dir without prompting (handy in a script), and
+`--yes` suppresses the prompt entirely. The editor is `code` by default,
+falling back to `cursor`, `code-insiders`, `codium`, then the macOS
+*Visual Studio Code.app*. Override it with `GHPR_EDITOR`:
+
+```bash
+GHPR_EDITOR="code -n" ghpr clean --open
+```
+
+If you get *no editor found*, install VS Code's shell command via the Command
+Palette → **Shell Command: Install 'code' command in PATH**.
+
 On Windows (PowerShell), use switch-style options instead:
 
 ```powershell
 ghpr clean -DryRun
 ghpr clean -Yes
 ghpr clean -Days 30
+ghpr clean -Open
 ```
 
 ## How It Works

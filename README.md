@@ -111,6 +111,29 @@ Example:
 ghpr https://github.com/octocat/Hello-World/pull/125
 ```
 
+### Handing the checkout off to an AI agent
+
+`ghpr` is a shell function, so it changes **your** shell's directory. That means
+you can chain any command after it and it runs inside the PR work directory —
+including [Claude Code](https://claude.com/claude-code):
+
+```bash
+# review the PR in an interactive session
+ghpr 125 octocat/Hello-World && claude "gh pr diff で差分を確認してレビューして"
+
+# one-shot (non-interactive) review printed to stdout
+ghpr 125 octocat/Hello-World && claude -p "このPRの差分をレビューして"
+```
+
+Wrap it in your own shell function if you do this often:
+
+```bash
+ghprc() { ghpr "$@" && claude "gh pr diff で差分を確認してレビューして"; }
+```
+
+The same works for anything else you want to launch in the checkout — `code .`,
+`cursor .`, `gh pr view --web`, your test command, and so on.
+
 ### Cleaning up old work directories
 
 Over time `~/work/prs/` fills up with clones for PRs you've already finished

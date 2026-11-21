@@ -87,3 +87,15 @@ pwd  # Should be in ~/work/prs/repo-pr125/
 - Both scripts handle bash and zsh differences (e.g., `BASH_REMATCH` vs `match` array)
 - Error handling uses `set -euo pipefail` in the core script for safety
 - The shell function uses `return` instead of `exit` to avoid closing the user's shell
+
+### Speed: how the core script avoids waiting on the network
+
+Each round trip to GitHub costs ~0.5–0.8s regardless of payload, so the core script avoids them or overlaps them. `gh` stays the source of truth: every fast path either reproduces what `gh` would have done or hands over to it.
+
+- **`seed_clone` / `seed_finish`**: when another work dir of the same repo exists, a new work dir is built from it with `git clone --local` (hardlinked objects, no network) instead of downloading the repo again. The sibling's own branches are dropped; its `origin/*` refs, remote URL and (for forks) `upstream` remote are carried over. Hardlinks keep the new clone valid after `clean` deletes the sibling. A seeded clone is unfinished until the caller has fetched with `--prune` and called `seed_finish`, which sets `origin/HEAD` and creates the local default branch — after that it is indistinguishable from a fresh `gh repo clone`. Shallow, partial, or alternates-backed siblings are never used.
+- **`fast_pr_checkout`**: asks the API for the PR's head branch (`gh api repos/<slug>/pulls/<n>`, in the background) while `git fetch origin` runs, then checks the branch out exactly as `gh pr checkout` does for a same-repo PR (local branch of the same name tracking `origin/<branch>`, fast-forwarded). Fork PRs, deleted head branches, diverged local branches and any error return 1 and the caller runs `gh pr checkout`.
+- **`clone_repo`** clones with `--no-checkout` because every caller checks out its own branch next. If a PR checkout then fails on a fresh clone, `git reset --hard` materialises the default branch so an ordinary clone is left behind, as before.
+- **`create`** takes the default branch from a just-made clone's `origin/HEAD` (no API call, no extra fetch); for existing or seeded dirs it runs `gh repo view` in the background while fetching.
+- The core script must stay runnable on macOS's stock bash 3.2 (no `${var,,}`, `EPOCHREALTIME`, `wait -n`, associative arrays).
+
+`ghpr.ps1` has none of this; it still runs `gh repo clone` then `gh pr checkout` sequentially.

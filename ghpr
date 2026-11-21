@@ -98,26 +98,53 @@ create_branch() {
 
   echo "==> Use workdir: ${work_dir}"
 
+  local fresh=0
+  CLONE_SEEDED=0
   if [ ! -d "${work_dir}/.git" ]; then
-    echo "==> No git repo found in ${work_dir}. Cloning via gh repo clone..."
+    echo "==> No git repo found in ${work_dir}. Cloning..."
     rm -rf "${work_dir}"
-    gh repo clone "${repo_slug}" "${work_dir}"
+    clone_repo "${repo_slug}" "${work_dir}"
+    fresh=1
   else
     echo "==> Existing git repo found in ${work_dir}"
   fi
 
   cd "${work_dir}"
 
-  # Resolve the default branch (main/master) from the remote, with fallbacks.
-  local default_branch
-  default_branch="$(gh repo view "${repo_slug}" --json defaultBranchRef --jq '.defaultBranchRef.name' 2>/dev/null || true)"
-  if [ -z "$default_branch" ]; then
-    default_branch="$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@' || true)"
-  fi
-  [ -z "$default_branch" ] && default_branch="main"
+  # Default branch (main/master). A clone made over the network just now has an
+  # authoritative origin/HEAD and is up to date, so it needs neither the API nor
+  # a fetch. Otherwise ask the API, and fetch while waiting for the answer.
+  local guess default_branch
+  guess="$(git symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+  guess="${guess#origin/}"
+  default_branch="$guess"
 
-  echo "==> Fetching latest origin/${default_branch}..."
-  git fetch origin "${default_branch}"
+  if [ "$fresh" -eq 0 ] || [ "$CLONE_SEEDED" -eq 1 ] || [ -z "$guess" ]; then
+    make_tmp
+    gh repo view "${repo_slug}" --json defaultBranchRef --jq '.defaultBranchRef.name' \
+      >"$GHPR_TMP" 2>/dev/null &
+    local info_pid=$!
+    local fetched_guess=0
+    if [ "$CLONE_SEEDED" -eq 1 ]; then
+      echo "==> Fetching origin..."
+      gitgh fetch -q --prune origin 2>/dev/null || git fetch --prune origin
+    elif [ -n "$guess" ]; then
+      echo "==> Fetching latest origin/${guess}..."
+      if gitgh fetch -q origin "${guess}" 2>/dev/null; then fetched_guess=1; fi
+    fi
+    wait "$info_pid" || true
+    default_branch="$(cat "$GHPR_TMP" 2>/dev/null || true)"
+    [ -z "$default_branch" ] && default_branch="$guess"
+    [ -z "$default_branch" ] && default_branch="main"
+
+    [ "$CLONE_SEEDED" -eq 1 ] && seed_finish "$default_branch"
+
+    # Not covered by the fetch above (different name, or that fetch failed).
+    if [ "$CLONE_SEEDED" -eq 0 ] && { [ "$default_branch" != "$guess" ] || [ "$fetched_guess" -eq 0 ]; }; then
+      echo "==> Fetching latest origin/${default_branch}..."
+      git fetch origin "${default_branch}"
+    fi
+  fi
 
   if git show-ref --verify --quiet "refs/heads/${branch}"; then
     echo "==> Branch '${branch}' already exists locally; checking it out"
@@ -158,6 +185,166 @@ parse_repo_slug() {
     name="${name%.git}"
     printf '%s/%s\n' "$owner" "$name"
   fi
+}
+
+# Find an existing work dir that is a full, self-contained clone of <slug>, to
+# seed a new work dir from. Prints its path, or nothing.
+find_reference_repo() {
+  local slug="$1" repo_name="${1##*/}" exclude="${2:-}"
+  local want d url have
+  want="$(printf '%s' "$slug" | tr '[:upper:]' '[:lower:]')"
+  for d in "${base_dir}/${repo_name}"-*; do
+    [ -d "$d/.git" ] || continue
+    [ "$d" = "$exclude" ] && continue
+    # Shallow / borrowed / partial object stores are not safe to copy from.
+    [ -e "$d/.git/shallow" ] && continue
+    [ -e "$d/.git/objects/info/alternates" ] && continue
+    [ -n "$(git -C "$d" config --get-regexp '^remote\..*\.promisor$' 2>/dev/null || true)" ] && continue
+    url="$(git -C "$d" remote get-url origin 2>/dev/null || true)"
+    have="$(parse_repo_slug "$url" | tr '[:upper:]' '[:lower:]')"
+    if [ "$have" = "$want" ]; then
+      printf '%s\n' "$d"
+      return 0
+    fi
+  done
+  return 0
+}
+
+# git, authenticating to github.com the way gh's own git calls do, and never
+# stopping to prompt (callers fall back to plain git / gh on failure).
+gitgh() {
+  GIT_TERMINAL_PROMPT=0 git \
+    -c credential.https://github.com.helper= \
+    -c 'credential.https://github.com.helper=!gh auth git-credential' "$@"
+}
+
+# Scratch file for the output of a background `gh` call.
+GHPR_TMP=""
+make_tmp() {
+  GHPR_TMP="$(mktemp "${TMPDIR:-/tmp}/ghpr.XXXXXX")"
+  trap 'rm -f "$GHPR_TMP"' EXIT
+}
+
+# Build <dest> from a sibling work dir of the same repo WITHOUT touching the
+# network: `git clone --local` hardlinks the object store (instant, and safe
+# when `ghpr clean` later deletes the sibling), then the sibling's own branches
+# are dropped and its last-known origin/* (and upstream/*) refs and remote URLs
+# are carried over.
+# The result is NOT a finished clone: origin/* may be stale and there is no
+# local branch or working tree. The caller must fetch with --prune and then
+# call seed_finish. Returns 1 (leaving no <dest>) when there is no usable sibling.
+seed_clone() {
+  local slug="$1" dest="$2" ref url r rurl resolved
+  ref="$(find_reference_repo "$slug" "$dest")"
+  [ -n "$ref" ] || return 1
+  url="$(git -C "$ref" remote get-url origin 2>/dev/null || true)"
+  [ -n "$url" ] || return 1
+
+  echo "==> Seeding from $(basename "$ref") (local copy, no download)"
+  if git clone -q --local --no-checkout --origin ghpr-seed "$ref" "$dest" 2>/dev/null \
+     && git -C "$dest" symbolic-ref HEAD refs/heads/ghpr-seed-unborn \
+     && { git -C "$dest" for-each-ref --format='delete %(refname)' refs/heads
+          git -C "$ref" for-each-ref --format='%(symref)|create %(refname) %(objectname)' \
+              refs/remotes/origin refs/remotes/upstream | sed -n 's/^|//p'
+        } | git -C "$dest" update-ref --stdin \
+     && git -C "$dest" remote remove ghpr-seed \
+     && git -C "$dest" remote add origin "$url"; then
+    # gh repo clone gives forks an "upstream" remote; keep it if the sibling has one.
+    for r in upstream; do
+      rurl="$(git -C "$ref" remote get-url "$r" 2>/dev/null || true)"
+      [ -n "$rurl" ] || continue
+      git -C "$dest" remote add "$r" "$rurl" 2>/dev/null || true
+      resolved="$(git -C "$ref" config --get "remote.${r}.gh-resolved" 2>/dev/null || true)"
+      [ -n "$resolved" ] && git -C "$dest" config "remote.${r}.gh-resolved" "$resolved"
+    done
+    r="$(git -C "$ref" symbolic-ref -q refs/remotes/origin/HEAD 2>/dev/null || true)"
+    [ -n "$r" ] && git -C "$dest" symbolic-ref refs/remotes/origin/HEAD "$r" 2>/dev/null || true
+    return 0
+  fi
+  rm -rf "$dest"
+  return 1
+}
+
+# Second half of seed_clone, run in the seeded repo after its fetch: point
+# origin/HEAD at the default branch and create the local default branch, so the
+# repo looks like a `git clone --no-checkout` made just now.
+# $1 = default branch name if known (else the carried-over origin/HEAD is used).
+seed_finish() {
+  local d="${1:-}"
+  if [ -n "$d" ] && git show-ref --verify --quiet "refs/remotes/origin/${d}"; then
+    git remote set-head origin "$d" >/dev/null 2>&1 || true
+  else
+    d="$(git symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+    d="${d#origin/}"
+  fi
+  [ -n "$d" ] || return 0
+  git show-ref --verify --quiet "refs/remotes/origin/${d}" || return 0
+  git show-ref --verify --quiet "refs/heads/${d}" \
+    || git branch -q --track "$d" "origin/${d}" >/dev/null 2>&1 || return 0
+  git symbolic-ref HEAD "refs/heads/${d}"
+}
+
+# Clone <slug> into <dest> with no working tree (every caller checks out its
+# own branch right away, or restores the default one on failure).
+# Seeds from a sibling work dir when possible (no network; sets CLONE_SEEDED=1
+# so the caller knows it still has to fetch and seed_finish), else gh repo clone.
+CLONE_SEEDED=0
+clone_repo() {
+  local slug="$1" dest="$2"
+  CLONE_SEEDED=0
+  if seed_clone "$slug" "$dest"; then
+    CLONE_SEEDED=1
+    return 0
+  fi
+  gh repo clone "$slug" "$dest" -- --no-checkout
+}
+
+# Check out PR <number> of <owner/repo> in the current repo, doing what
+# `gh pr checkout` does for a same-repo PR (local branch named after the PR's
+# head branch, tracking origin/<branch>, fast-forwarded) but with the PR lookup
+# and the git fetch running at the same time instead of one after the other.
+# Also completes a seeded clone (CLONE_SEEDED=1).
+# Returns 1 when the PR is not a plain same-repo PR or anything goes wrong; the
+# caller then runs `gh pr checkout`, so gh stays the source of truth.
+fast_pr_checkout() {
+  local number="$1" repo="$2"
+  local fetched=0 info_pid="" base_repo="" head_repo="" default_branch="" head_ref="" current
+
+  if [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    make_tmp
+    gh api "repos/${repo}/pulls/${number}" \
+      --jq '[.base.repo.full_name, (.head.repo.full_name // ""), .base.repo.default_branch, .head.ref] | join(":")' \
+      >"$GHPR_TMP" 2>/dev/null &
+    info_pid=$!
+  fi
+
+  if [ "$CLONE_SEEDED" -eq 1 ]; then
+    if gitgh fetch -q --prune origin 2>/dev/null || git fetch --prune origin; then fetched=1; fi
+  else
+    if gitgh fetch -q origin 2>/dev/null; then fetched=1; fi
+  fi
+
+  if [ -n "$info_pid" ]; then
+    wait "$info_pid" || true
+    IFS=: read -r base_repo head_repo default_branch head_ref <"$GHPR_TMP" || true
+  fi
+
+  [ "$CLONE_SEEDED" -eq 1 ] && seed_finish "$default_branch"
+
+  [ "$fetched" -eq 1 ] || return 1
+  { [ -n "$head_ref" ] && [ -n "$base_repo" ] && [ "$head_repo" = "$base_repo" ]; } || return 1
+  git show-ref --verify --quiet "refs/remotes/origin/${head_ref}" || return 1
+
+  if git show-ref --verify --quiet "refs/heads/${head_ref}"; then
+    current="$(git symbolic-ref -q --short HEAD 2>/dev/null || true)"
+    if [ "$current" != "$head_ref" ] || [ ! -e "$(git rev-parse --git-dir)/index" ]; then
+      git checkout -q "$head_ref" 2>/dev/null || return 1
+    fi
+    git merge -q --ff-only "refs/remotes/origin/${head_ref}" 2>/dev/null || return 1
+  else
+    git checkout -q -b "$head_ref" --track "origin/${head_ref}" 2>/dev/null || return 1
+  fi
+  echo "==> Checked out PR #${number} on branch '${head_ref}'"
 }
 
 # Return 0 (true) if the repo has work that could be lost on deletion.
@@ -454,16 +641,26 @@ work_dir="${base_dir}/${repo_name}-pr${pr_number}"
 
 echo "==> Use workdir: ${work_dir}"
 
+fresh_clone=0
+CLONE_SEEDED=0
 if [ ! -d "${work_dir}/.git" ]; then
-  echo "==> No git repo found in ${work_dir}. Cloning via gh repo clone..."
+  echo "==> No git repo found in ${work_dir}. Cloning..."
   rm -rf "${work_dir}"
   cd "${base_dir}"
-  gh repo clone "${repo}" "${work_dir}"
+  clone_repo "${repo}" "${work_dir}"
+  fresh_clone=1
 else
   echo "==> Existing git repo found in ${work_dir}"
 fi
 
 cd "${work_dir}"
 
-echo "==> Running: gh pr checkout ${pr_number} --repo ${repo}"
-gh pr checkout "${pr_number}" --repo "${repo}"
+if ! fast_pr_checkout "${pr_number}" "${repo}"; then
+  echo "==> Running: gh pr checkout ${pr_number} --repo ${repo}"
+  if ! gh pr checkout "${pr_number}" --repo "${repo}"; then
+    # The clone was made without a working tree; give it the default branch's
+    # files so a failed checkout leaves an ordinary clone behind.
+    [ "$fresh_clone" -eq 1 ] && git reset -q --hard 2>/dev/null || true
+    exit 1
+  fi
+fi
